@@ -1,4 +1,5 @@
-import os,csv,io,secrets,sqlite3
+
+import os,csv,io,secrets,sqlite3,json,urllib.parse,urllib.request
 from datetime import datetime
 from fastapi import FastAPI,Request,Form,UploadFile,File
 from fastapi.responses import HTMLResponse,RedirectResponse,StreamingResponse,JSONResponse
@@ -49,25 +50,293 @@ def dash(request:Request):
  rows="".join(f"<tr><td><b>{r['company_name']}</b><small>{r['contact_name'] or 'No contact'} · {r['job_title'] or '—'}</small></td><td>{r['country'] or '—'}</td><td><span class=tag>{r['category'] or 'Company'}</span></td><td>{r['email'] or '—'}</td><td><a class=iconbtn href=/leads/{r['id']}>→</a></td></tr>" for r in recent) or "<tr><td colspan=5>No leads available.</td></tr>"
  body=cards+search+f"""<div class=twocol><section class=card><div class=cardhead><div><small>ANALYTICS</small><h3>Top Industries</h3></div></div>{tophtml}</section><section class=card><div class=cardhead><div><small>DATABASE</small><h3>Recent Leads</h3></div><a class=btn href=/leads>View all →</a></div><div class=tablewrap><table><tr><th>COMPANY</th><th>COUNTRY</th><th>TYPE</th><th>EMAIL</th><th></th></tr>{rows}</table></div></section></div>"""
  return layout("Dashboard",body)
-@app.get("/finder",response_class=HTMLResponse)
-def finder(request:Request,q="",country="",industry="",category="",size="",event=""):
- if g:=guard(request): return g
- c=db(); clauses=[]; args=[]
- vals=[("country",country),("industry",industry),("category",category),("company_size",size),("event_type",event)]
- for f,v in vals:
-  if v: clauses.append(f"{f}=?");args.append(v)
- if q: clauses.append("(company_name like ? or email like ? or contact_name like ? or industry like ? or event_type like ?)");args += [f"%{q}%"]*5
- where=" WHERE "+" AND ".join(clauses) if clauses else ""
- rows=c.execute("select * from leads"+where+" order by score desc,id desc limit 500",args).fetchall()
- countries=c.execute("select distinct country from leads where country!='' order by country").fetchall(); inds=c.execute("select distinct industry from leads where industry!='' order by industry").fetchall(); c.close()
- opts=lambda rs,cur:"".join(f"<option {'selected' if x[0]==cur else ''}>{x[0]}</option>" for x in rs)
- body=f"""<div class=searchpanel><div class=searchtitle><span class=kicker>LEAD FINDER</span><h2>Discover your next opportunity</h2><p>Use multiple filters to narrow down your target market.</p></div>
- <form class=filtergrid><label>Keyword<input name=q value="{q}" placeholder="Company, person, email..."></label><label>Country<select name=country><option value="">All Countries</option>{opts(countries,country)}</select></label><label>Industry<select name=industry><option value="">All Industries</option>{opts(inds,industry)}</select></label>
- <label>Category<select name=category><option value="">All Types</option>{''.join(f'<option {"selected" if category==x else ""}>{x}</option>' for x in ["Company","Delegate","Sponsor","Partner"])}</select></label><label>Company Size<select name=size><option value="">Any Size</option>{''.join(f'<option {"selected" if size==x else ""}>{x}</option>' for x in ["1-10","11-50","51-200","201-500","501-1000","1001+"])}</select></label><label>Event / Topic<input name=event value="{event}" placeholder="Clinical Trials..."></label><button>Run Search →</button><a class=btn href=/finder>Clear</a></form></div>
- <div class=card><div class=cardhead><div><small>SEARCH RESULTS</small><h3>{len(rows)} leads found</h3></div><a class=btn href=/export.csv>Export results</a></div><div class=tablewrap><table><tr><th>COMPANY / CONTACT</th><th>LOCATION</th><th>INDUSTRY</th><th>TYPE</th><th>CONTACT</th><th>SCORE</th><th></th></tr>"""
- body+="".join(f"<tr><td><b>{r['company_name']}</b><small>{r['contact_name'] or 'No contact'} · {r['job_title'] or '—'}</small></td><td>{r['city'] or '—'}<br>{r['country'] or '—'}</td><td>{r['industry'] or '—'}</td><td><span class=tag>{r['category'] or 'Company'}</span></td><td>{r['email'] or '—'}<br>{r['phone'] or ''}</td><td><span class=score>{r['score']}/100</span></td><td><a class=iconbtn href=/leads/{r['id']}>→</a></td></tr>" for r in rows) or "<tr><td colspan=7 class=empty>No matching leads. Try broader filters.</td></tr>"
- body+="</table></div></div>"
- return layout("Lead Finder",body,"finder")
+@app.get("/finder", response_class=HTMLResponse)
+def finder(request: Request, q="", country="", industry="", category="", size="", event=""):
+    if g := guard(request):
+        return g
+
+    import html
+    online = ""
+
+    if q.strip():
+        key = os.getenv("HUNTER_API_KEY", "")
+
+        if not key:
+            online = """
+            <div class="card">
+                HUNTER_API_KEY is missing in Environment Variables.
+            </div>
+            """
+        else:
+            try:
+                params = urllib.parse.urlencode({
+                    "company": q.strip(),
+                    "api_key": key
+                })
+                url = "https://api.hunter.io/v2/domain-search?" + params
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "LeadsMasterPro/1.0"}
+                )
+
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+
+                d = data.get("data", {})
+                emails = d.get("emails", [])
+
+                organization = html.escape(str(d.get("organization") or q))
+                domain = html.escape(str(d.get("domain") or "Not found"))
+
+                online = f"""
+                <div class="card">
+                    <div class="cardhead">
+                        <div>
+                            <small>HUNTER ONLINE SEARCH</small>
+                            <h3>{organization}</h3>
+                        </div>
+                        <span class="tag">{domain}</span>
+                    </div>
+                    <p>Website domain: {domain}</p>
+                    <div class="tablewrap">
+                    <table>
+                    <tr>
+                        <th>CONTACT NAME</th>
+                        <th>JOB TITLE</th>
+                        <th>EMAIL</th>
+                        <th>TYPE</th>
+                    </tr>
+                """
+
+                if emails:
+                    for e in emails:
+                        name = " ".join(
+                            x for x in [
+                                e.get("first_name"),
+                                e.get("last_name")
+                            ] if x
+                        ) or "Not available"
+
+                        name = html.escape(str(name))
+                        position = html.escape(str(e.get("position") or "—"))
+                        email = html.escape(str(e.get("value") or "—"))
+                        email_type = html.escape(str(e.get("type") or "—"))
+
+                        online += f"""
+                        <tr>
+                            <td>{name}</td>
+                            <td>{position}</td>
+                            <td>{email}</td>
+                            <td>{email_type}</td>
+                        </tr>
+                        """
+                else:
+                    online += """
+                    <tr>
+                        <td colspan="4">No emails found for this company.</td>
+                    </tr>
+                    """
+
+                online += """
+                    </table>
+                    </div>
+                    <p class="muted">
+                        Results depend on Hunter's database and API plan.
+                    </p>
+                </div>
+                """
+
+            except Exception:
+                online = """
+                <div class="card">
+                    Online search failed. Check your Hunter API key,
+                    API credits, and company name, then try again.
+                </div>
+                """
+
+    c = db()
+    clauses = []
+    args = []
+
+    vals = [
+        ("country", country),
+        ("industry", industry),
+        ("category", category),
+        ("company_size", size),
+        ("event_type", event)
+    ]
+
+    for f, v in vals:
+        if v:
+            clauses.append(f"{f}=?")
+            args.append(v)
+
+    if q:
+        clauses.append(
+            "(company_name LIKE ? OR email LIKE ? "
+            "OR contact_name LIKE ? OR industry LIKE ? "
+            "OR event_type LIKE ?)"
+        )
+        args += [f"%{q}%"] * 5
+
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+
+    rows = c.execute(
+        "SELECT * FROM leads" + where +
+        " ORDER BY score DESC, id DESC LIMIT 500",
+        args
+    ).fetchall()
+
+    countries = c.execute(
+        "SELECT DISTINCT country FROM leads "
+        "WHERE country!='' ORDER BY country"
+    ).fetchall()
+
+    inds = c.execute(
+        "SELECT DISTINCT industry FROM leads "
+        "WHERE industry!='' ORDER BY industry"
+    ).fetchall()
+
+    c.close()
+
+    def opts(rs, cur):
+        return "".join(
+            f'<option value="{html.escape(str(x[0]), quote=True)}" '
+            f'{"selected" if x[0] == cur else ""}>'
+            f'{html.escape(str(x[0]))}</option>'
+            for x in rs
+        )
+
+    safe_q = html.escape(q, quote=True)
+    safe_event = html.escape(event, quote=True)
+
+    body = f"""
+    <div class="searchpanel">
+        <div class="searchtitle">
+            <span class="kicker">LEAD FINDER</span>
+            <h2>Discover your next opportunity</h2>
+            <p>Search saved leads and look up company details online.</p>
+        </div>
+
+        <form class="filtergrid" action="/finder" method="get">
+            <label>Company / Keyword
+                <input name="q" value="{safe_q}"
+                placeholder="e.g. Microsoft">
+            </label>
+
+            <label>Country
+                <select name="country">
+                    <option value="">All Countries</option>
+                    {opts(countries, country)}
+                </select>
+            </label>
+
+            <label>Industry
+                <select name="industry">
+                    <option value="">All Industries</option>
+                    {opts(inds, industry)}
+                </select>
+            </label>
+
+            <label>Category
+                <select name="category">
+                    <option value="">All Types</option>
+                    {''.join(
+                        f'<option value="{x}" '
+                        f'{"selected" if category == x else ""}>{x}</option>'
+                        for x in ["Company", "Delegate", "Sponsor", "Partner"]
+                    )}
+                </select>
+            </label>
+
+            <label>Company Size
+                <select name="size">
+                    <option value="">Any Size</option>
+                    {''.join(
+                        f'<option value="{x}" '
+                        f'{"selected" if size == x else ""}>{x}</option>'
+                        for x in ["1-10", "11-50", "51-200",
+                                  "201-500", "501-1000", "1001+"]
+                    )}
+                </select>
+            </label>
+
+            <label>Event / Topic
+                <input name="event" value="{safe_event}"
+                placeholder="Clinical Trials...">
+            </label>
+
+            <button type="submit">Run Search →</button>
+            <a class="btn" href="/finder">Clear</a>
+        </form>
+    </div>
+
+    {online}
+
+    <div class="card">
+        <div class="cardhead">
+            <div>
+                <small>SAVED DATABASE RESULTS</small>
+                <h3>{len(rows)} leads found</h3>
+            </div>
+            <a class="btn" href="/export.csv">Export results</a>
+        </div>
+
+        <div class="tablewrap">
+            <table>
+                <tr>
+                    <th>COMPANY / CONTACT</th>
+                    <th>LOCATION</th>
+                    <th>INDUSTRY</th>
+                    <th>TYPE</th>
+                    <th>CONTACT</th>
+                    <th>SCORE</th>
+                    <th></th>
+                </tr>
+    """
+
+    for r in rows:
+        company = html.escape(str(r["company_name"] or "—"))
+        contact = html.escape(str(r["contact_name"] or "No contact"))
+        job = html.escape(str(r["job_title"] or "—"))
+        city = html.escape(str(r["city"] or "—"))
+        country_name = html.escape(str(r["country"] or "—"))
+        ind = html.escape(str(r["industry"] or "—"))
+        cat = html.escape(str(r["category"] or "Company"))
+        email = html.escape(str(r["email"] or "—"))
+        phone = html.escape(str(r["phone"] or ""))
+        score = html.escape(str(r["score"] or 0))
+        lead_id = int(r["id"])
+
+        body += f"""
+        <tr>
+            <td><b>{company}</b><small>{contact} · {job}</small></td>
+            <td>{city}<br>{country_name}</td>
+            <td>{ind}</td>
+            <td><span class="tag">{cat}</span></td>
+            <td>{email}<br>{phone}</td>
+            <td><span class="score">{score}/100</span></td>
+            <td><a class="iconbtn" href="/leads/{lead_id}">→</a></td>
+        </tr>
+        """
+
+    if not rows:
+        body += """
+        <tr>
+            <td colspan="7" class="empty">
+                No matching saved leads. Try broader filters.
+            </td>
+        </tr>
+        """
+
+    body += """
+            </table>
+        </div>
+    </div>
+    """
+
+    return layout("Lead Finder", body, "finder")
+
 @app.get("/leads",response_class=HTMLResponse)
 def all_leads(request:Request,q=""):
  if g:=guard(request): return g
